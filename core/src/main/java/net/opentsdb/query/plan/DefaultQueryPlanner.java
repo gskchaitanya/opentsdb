@@ -134,7 +134,7 @@ public class DefaultQueryPlanner implements QueryPlanner {
             } else if (split.length == 1) {
               sink_filter.put(split[0], null);
             } else {
-              throw new RuntimeException("WTF?? Invalid filter: " + filter);
+              throw new RuntimeException("Invalid filter: " + filter);
             }
           }
         }
@@ -263,6 +263,10 @@ public class DefaultQueryPlanner implements QueryPlanner {
           }
         }
         
+        if (LOG.isTraceEnabled()) {
+          LOG.trace(printConfigGraph());          
+        }
+        
         if (context.query().isTraceEnabled()) {
           context.queryContext().logTrace(printConfigGraph());
         }
@@ -276,9 +280,11 @@ public class DefaultQueryPlanner implements QueryPlanner {
               @Override
               public Deferred<Void> call(Void arg) throws Exception {
                 if (data_sources.isEmpty()) {
-                  LOG.error("WTF? No final node for query: " + context.query());
+                  LOG.error("No data sources in the final graph for: " 
+                      + context.query() + " " + printConfigGraph());
                   return Deferred.<Void>fromError(new RuntimeException(
-                      "WTF? No data sources in the graph!!!!"));
+                      "No data sources in the final graph for: " 
+                          + context.query() + " " + printConfigGraph()));
                 }
                 return null;
               }
@@ -539,6 +545,7 @@ public class DefaultQueryPlanner implements QueryPlanner {
         throw new IllegalStateException("Factory returned a null "
             + "instance for " + node);
       }
+      
       graph.addNode(query_node);
       nodes_map.put(query_node.config().getId(), query_node);
     }
@@ -554,7 +561,7 @@ public class DefaultQueryPlanner implements QueryPlanner {
     for (final QueryNode source_node : sources) {
       graph.putEdge(query_node, source_node);
       if (Graphs.hasCycle(graph)) {
-        throw new IllegalArgumentException("WTF?? Cycle adding " 
+        throw new IllegalArgumentException("Cycle adding " 
             + query_node + " => " + source_node);
       }
     }
@@ -593,6 +600,20 @@ public class DefaultQueryPlanner implements QueryPlanner {
   @Override
   public QueryNode nodeForId(final String id) {
     return nodes_map.get(id);
+  }
+  
+  /**
+   * Helper for unit testing.
+   * @param id A non-null ID to search for.
+   * @return The matching config node if found, null if not.
+   */
+  public QueryNodeConfig configNodeForId(final String id) {
+    for (final QueryNodeConfig config : config_graph.nodes()) {
+      if (config.getId().equals(id)) {
+        return config;
+      }
+    }
+    return null;
   }
   
   /**

@@ -553,10 +553,23 @@ public abstract class AbstractQueryPipelineContext implements QueryPipelineConte
     public void close() {
       if (result.source().config() instanceof TimeSeriesDataSourceConfig ||
           result.source().config().joins()) {
-        countdowns.get(result.dataSource()).decrementAndGet();
+        AtomicInteger cntr = countdowns.get(result.dataSource());
+        if (cntr == null) {
+          LOG.error("Unexpected result source, no counter for: " 
+              + result.dataSource());
+        } else {
+          cntr.decrementAndGet();
+        }
       } else {
-        countdowns.get(result.source().config().getId() + ":" 
-            + result.dataSource()).decrementAndGet();
+        AtomicInteger cntr = countdowns.get(result.source().config().getId() + ":" 
+            + result.dataSource());
+        if (cntr == null) {
+          LOG.error("Unexpected result source, noo counter for: " 
+              + result.source().config().getId() + ":" 
+              + result.dataSource());
+        } else {
+          cntr.decrementAndGet();
+        }
       }
       checkComplete();
       try {

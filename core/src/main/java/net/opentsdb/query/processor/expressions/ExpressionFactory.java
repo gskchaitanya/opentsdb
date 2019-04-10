@@ -115,7 +115,9 @@ public class ExpressionFactory extends BaseQueryNodeFactory {
           builder.addSource(ds);
           last_source = ds;
         } else {
-          throw new RuntimeException("WTF? No node for left?");
+          throw new RuntimeException("Failed to find a data source for the "
+              + "left operand: " + parse_node.getLeft() + " for expression node: " 
+              + config.getId());
         }
       }
       
@@ -127,7 +129,9 @@ public class ExpressionFactory extends BaseQueryNodeFactory {
             builder.addSource(ds);
           }
         } else {
-          throw new RuntimeException("WTF? No node for right?");
+          throw new RuntimeException("Failed to find a data source for the "
+              + "right operand: " + parse_node.getRight() + " for expression node: " 
+              + config.getId());
         }
       }
       final ExpressionParseNode rebuilt = 
@@ -187,7 +191,8 @@ public class ExpressionFactory extends BaseQueryNodeFactory {
     final String key = left ? (String) builder.left() : (String) builder.right();
     final String node_id = Strings.isNullOrEmpty(downstream.getType()) ? 
         downstream.getId() : downstream.getType();
-    if (depth > 0 && node_id.toLowerCase().equals("expression")) {
+    if (depth > 0 && (node_id.toLowerCase().equals("expression") || 
+        node_id.toLowerCase().equals("binaryexpression"))) {
       if (left && key.equals(downstream.getId())) {
         if (downstream instanceof ExpressionConfig) {
           builder.setLeft(((ExpressionConfig) downstream).getAs());
@@ -227,7 +232,7 @@ public class ExpressionFactory extends BaseQueryNodeFactory {
         return downstream.getId();
       }
     } else if (depth > 0 && downstream.joins()) {
-      if (joinsRecursive(builder, left, downstream, plan, depth)) {
+      if (joinsRecursive(builder, left, downstream, plan, downstream.getId(), depth)) {
         if (left) {
           builder.setLeftId(downstream.getId());
         } else {
@@ -251,14 +256,26 @@ public class ExpressionFactory extends BaseQueryNodeFactory {
     return null;
   }
 
+  /**
+   * NOTE: Still not perfect. I'd like to clean this up some day. For now it'll
+   * work for HAClusterConfig.
+   * @param builder
+   * @param left
+   * @param config
+   * @param plan
+   * @param join_node_id
+   * @param depth
+   * @return
+   */
   static boolean joinsRecursive(final ExpressionParseNode.Builder builder, 
                                 final boolean left,
                                 final QueryNodeConfig config, 
                                 final QueryPlanner plan,
+                                final String join_node_id,
                                 final int depth) {
     final String key = left ? (String) builder.left() : (String) builder.right();
     if (config instanceof TimeSeriesDataSourceConfig) {
-      if (left && key.equals(config.getId())) {
+      if (left && key.equals(join_node_id)) {
         builder.setLeft(((TimeSeriesDataSourceConfig) config)
                  .getMetric().getMetric());
         return true;
@@ -267,7 +284,7 @@ public class ExpressionFactory extends BaseQueryNodeFactory {
               .getMetric().getMetric())) {
         return true;
         // right
-      } else if (key.equals(config.getId())) {
+      } else if (key.equals(join_node_id)) {
         builder.setRight(((TimeSeriesDataSourceConfig) config)
                  .getMetric().getMetric());
         return true;
@@ -278,7 +295,7 @@ public class ExpressionFactory extends BaseQueryNodeFactory {
     }
     
     for (final QueryNodeConfig successor : plan.configGraph().successors(config)) {
-      if (joinsRecursive(builder, left, successor, plan, depth + 1)) {
+      if (joinsRecursive(builder, left, successor, plan, join_node_id, depth + 1)) {
         return true;
       }
     }

@@ -14,28 +14,11 @@
 // limitations under the License.
 package net.opentsdb.query.execution;
 
-import java.io.UnsupportedEncodingException;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
-import java.util.concurrent.RejectedExecutionException;
-
-import org.apache.http.Header;
-import org.apache.http.HttpResponse;
-import org.apache.http.client.methods.HttpPost;
-import org.apache.http.concurrent.FutureCallback;
-import org.apache.http.entity.StringEntity;
-import org.apache.http.impl.nio.client.CloseableHttpAsyncClient;
-import org.apache.http.util.EntityUtils;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
 import com.fasterxml.jackson.databind.JsonNode;
 import com.google.common.base.Strings;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
-
 import net.opentsdb.common.Const;
 import net.opentsdb.data.TimeStamp;
 import net.opentsdb.exceptions.QueryExecutionCanceled;
@@ -49,15 +32,35 @@ import net.opentsdb.query.QueryPipelineContext;
 import net.opentsdb.query.QueryResult;
 import net.opentsdb.query.SemanticQuery;
 import net.opentsdb.query.TimeSeriesDataSourceConfig;
+import net.opentsdb.query.TimeSeriesDataSourceConfig.Builder;
 import net.opentsdb.query.execution.serdes.JsonV2QuerySerdesOptions;
 import net.opentsdb.query.filter.DefaultNamedFilter;
 import net.opentsdb.query.serdes.SerdesOptions;
 import net.opentsdb.stats.Span;
+import net.opentsdb.stats.StatsCollector.StatsTimer;
 import net.opentsdb.storage.SourceNode;
 import net.opentsdb.storage.schemas.tsdb1x.Schema;
 import net.opentsdb.utils.DateTime;
-import net.opentsdb.utils.JSON;
 import net.opentsdb.utils.DefaultSharedHttpClient;
+import net.opentsdb.utils.JSON;
+import net.opentsdb.utils.Pair;
+import org.apache.http.Header;
+import org.apache.http.HttpResponse;
+import org.apache.http.client.methods.HttpPost;
+import org.apache.http.concurrent.FutureCallback;
+import org.apache.http.entity.StringEntity;
+import org.apache.http.impl.nio.client.CloseableHttpAsyncClient;
+import org.apache.http.util.EntityUtils;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.UnsupportedEncodingException;
+import java.net.URI;
+import java.time.temporal.TemporalAmount;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.RejectedExecutionException;
 
 /**
  * An executor that fires an HTTP query against a V3 endpoint for a metric,
@@ -68,6 +71,8 @@ import net.opentsdb.utils.DefaultSharedHttpClient;
 public class HttpQueryV3Source extends AbstractQueryNode implements SourceNode {
   private static final Logger LOG = LoggerFactory.getLogger(
       HttpQueryV3Source.class);
+  
+  public static final String REMOTE_LATENCY_METRIC = "tsdb.executor.httpv3.latency";
   
   /** The query to execute. */
   private final TimeSeriesDataSourceConfig config;
@@ -130,11 +135,43 @@ public class HttpQueryV3Source extends AbstractQueryNode implements SourceNode {
         .setTimeZone(context.query().getTimezone())
         .setLogLevel(context.query().getLogLevel());
     
+    TimeSeriesDataSourceConfig.Builder source_builder = 
+        (Builder) ((TimeSeriesDataSourceConfig.Builder) config.toBuilder())
+        .setPushDownNodes(null)
+        .setSourceId(null) // TODO - we may want to make this configurable
+        .setType("TimeSeriesDataSource");
+    
+    if (((TimeSeriesDataSourceConfig) config).timeShifts() != null && 
+        ((TimeSeriesDataSourceConfig) config).timeShifts().containsKey(config.getId())) {
+      // we need to shift
+      Pair<Boolean, TemporalAmount> shift = 
+          ((TimeSeriesDataSourceConfig) config).timeShifts().get(config.getId());
+      final TimeStamp start_ts = context.query().startTime().getCopy();
+      final TimeStamp end_ts = context.query().endTime().getCopy();
+      if (shift.getKey()) {
+        start_ts.subtract(shift.getValue());
+        end_ts.subtract(shift.getValue());
+      } else {
+        start_ts.add(shift.getValue());
+        end_ts.add(shift.getValue());
+      }
+      
+      // TODO - handle nanos
+      // clear out the intervals and shift so the target doesn't re-compute
+      // the shifts.
+      builder.setStart(Long.toString(start_ts.msEpoch()));
+      builder.setEnd(Long.toString(end_ts.msEpoch()));
+      source_builder.setNextIntervals(0)
+                    .setPreviousIntervals(0)
+                    .setTimeShiftInterval(null);
+    }
+
     if (!Strings.isNullOrEmpty(config.getFilterId())) {
       builder.addFilter(DefaultNamedFilter.newBuilder()
           .setId(config.getFilterId())
           .setFilter(context.query().getFilter(config.getFilterId()))
           .build());
+
     }
     
     final Set<String> serdes_filters = Sets.newHashSet();
@@ -150,12 +187,7 @@ public class HttpQueryV3Source extends AbstractQueryNode implements SourceNode {
     
     // TODO - we need to confirm the graph links.
     Map<String, QueryNodeConfig> pushdowns = Maps.newHashMap();
-    pushdowns.put(config.getId(), 
-        ((TimeSeriesDataSourceConfig.Builder) config.toBuilder())
-          .setPushDownNodes(null)
-          .setSourceId(null) // TODO - we may want to make this configurable
-          .setType("TimeSeriesDataSource")
-          .build());
+    pushdowns.put(config.getId(), source_builder.build());
     for (final QueryNodeConfig pushdown : config.getPushDownNodes()) {
       pushdowns.put(pushdown.getId(), pushdown);
     }
@@ -193,19 +225,19 @@ public class HttpQueryV3Source extends AbstractQueryNode implements SourceNode {
     }
     
     final HttpPost post = new HttpPost(host + endpoint);
-    post.setHeader("Content-Type", "application/json");
+    post.addHeader("Content-Type", "application/json");
     final String user_header_key = context.tsdb().getConfig().getString(
         ((HttpQueryV3Factory) factory).getConfigKey(BaseHttpExecutorFactory.HEADER_USER_KEY));
     if (!Strings.isNullOrEmpty(user_header_key) && 
         context.queryContext().authState() != null) {
-      post.setHeader(user_header_key, context.queryContext().authState().getUser());
+      post.addHeader(user_header_key, context.queryContext().authState().getUser());
     }
     
     // may need to pass down a cookie.
     if (context.queryContext().authState() != null && 
         !Strings.isNullOrEmpty(context.queryContext().authState().getTokenType()) &&
         context.queryContext().authState().getTokenType().equalsIgnoreCase("cookie")) {
-      post.setHeader("Cookie", new String(
+      post.addHeader("Cookie", new String(
           context.queryContext().authState().getToken(), Const.UTF8_CHARSET));
     }
     
@@ -230,6 +262,11 @@ public class HttpQueryV3Source extends AbstractQueryNode implements SourceNode {
       return;
     }
     
+    final StatsTimer[] timer = new StatsTimer[] { 
+        pipelineContext().tsdb().getStatsCollector().startTimer(
+            REMOTE_LATENCY_METRIC, true) };
+    final String[] current_host = new String[] { HttpQueryV3Source.this.host };
+    
     /** Does the fun bit of parsing the response and calling the deferred. */
     class ResponseCallback implements FutureCallback<HttpResponse> {
       int retries = 0;
@@ -252,8 +289,11 @@ public class HttpQueryV3Source extends AbstractQueryNode implements SourceNode {
       @Override
       public void completed(final HttpResponse response) {
         try {
+          timer[0].stop("remote", current_host[0], "status", 
+              Integer.toString(response.getStatusLine().getStatusCode()));
+
           final Header header = response.getFirstHeader("X-Served-By");
-          String host = HttpQueryV3Source.this.host;
+          String host = current_host[0];
           if (header != null && header.getValue() != null) {
             host = header.getValue();
           }
@@ -273,16 +313,17 @@ public class HttpQueryV3Source extends AbstractQueryNode implements SourceNode {
                   retries < ((BaseHttpExecutorFactory) factory).retries()) {
                 retries++;
                 try {
-                  final String new_host = ((BaseHttpExecutorFactory) factory).nextHost();
-                  final HttpPost retry = new HttpPost(new_host + endpoint);
-                  retry.setEntity(post.getEntity());
+                  current_host[0] = ((BaseHttpExecutorFactory) factory).nextHost();
+                  post.setURI(URI.create(current_host[0]));
                   EntityUtils.consume(response.getEntity());
-                  client.execute(retry, this);
+                  timer[0] = pipelineContext().tsdb().getStatsCollector().startTimer(
+                      REMOTE_LATENCY_METRIC, true);
+                  client.execute(post, this);
                   context.queryContext().logWarn(HttpQueryV3Source.this, 
-                      "Retrying query to [" + new_host + endpoint + "] after " 
+                      "Retrying query to [" + current_host[0] + endpoint + "] after " 
                       + DateTime.msFromNanoDiff(DateTime.nanoTime(), start) + "ms");
                   if (LOG.isTraceEnabled()) {
-                    LOG.trace("Retrying Http query to a TSD: " + new_host + endpoint);
+                    LOG.trace("Retrying Http query to a TSD: " + current_host[0] + endpoint);
                   }
                   return;
                 } catch (IllegalStateException e) {
@@ -303,7 +344,8 @@ public class HttpQueryV3Source extends AbstractQueryNode implements SourceNode {
             
             sendUpstream(BadQueryResult.newBuilder()
                 .setNode(HttpQueryV3Source.this)
-                .setException(new QueryExecutionException("WTF??", 
+                .setException(new QueryExecutionException("Unexpected exception: " 
+                    + EntityUtils.toString(response.getEntity()), 
                     response.getStatusLine().getStatusCode()))
                 .setDataSource(config.getId())
                 .build());
@@ -318,11 +360,11 @@ public class HttpQueryV3Source extends AbstractQueryNode implements SourceNode {
           JsonNode results = root.get("results");
           if (results == null) {
             // could be an error, parse it.
-            LOG.error("WTF? No JSON results from: " + json);
+            LOG.error("No JSON results from: " + json);
             sendUpstream(BadQueryResult.newBuilder()
                 .setNode(HttpQueryV3Source.this)
                 .setException(new QueryExecutionException(
-                    "WTF? No JSON results from: " + json, 500))
+                    "No JSON results from: " + json, 500))
                 .setDataSource(config.getId())
                 .build());
           } else {
@@ -414,27 +456,30 @@ public class HttpQueryV3Source extends AbstractQueryNode implements SourceNode {
 
       @Override
       public void failed(final Exception e) {
+        timer[0].stop("remote", current_host[0], "status", "0");
+        
         if (factory instanceof BaseHttpExecutorFactory) {
           ((BaseHttpExecutorFactory) factory).markHostAsBad(
-              HttpQueryV3Source.this.host, 0);
+              current_host[0], 0);
           if (((BaseHttpExecutorFactory) factory).retries() > 0 && 
               retries < ((BaseHttpExecutorFactory) factory).retries()) {
             retries++;
-            final String host = ((BaseHttpExecutorFactory) factory).nextHost();
-            final HttpPost retry = new HttpPost(host + endpoint);
-            retry.setEntity(post.getEntity());
-            client.execute(retry, this);
+            current_host[0] = ((BaseHttpExecutorFactory) factory).nextHost();
+            post.setURI(URI.create(current_host[0]));
+            timer[0] = pipelineContext().tsdb().getStatsCollector().startTimer(
+                REMOTE_LATENCY_METRIC, true);
+            client.execute(post, this);
             context.queryContext().logWarn(HttpQueryV3Source.this, 
-                "Retrying query to [" + host + endpoint + "] after " 
+                "Retrying query to [" + current_host[0] + endpoint + "] after " 
                 + DateTime.msFromNanoDiff(DateTime.nanoTime(), start) + "ms");
             if (LOG.isTraceEnabled()) {
-              LOG.trace("Retrying Http query to a TSD: " + host + endpoint);
+              LOG.trace("Retrying Http query to a TSD: " + current_host[0] + endpoint);
             }
             return;
           }
         }
         
-        LOG.error("Failed response from: [" + host + endpoint + "]", e);
+        LOG.error("Failed response from: [" + current_host[0] + endpoint + "]", e);
         context.queryContext().logError(HttpQueryV3Source.this, 
             "Error sending query to [" + host + endpoint + "] after " 
             + DateTime.msFromNanoDiff(DateTime.nanoTime(), start) + "ms: " 

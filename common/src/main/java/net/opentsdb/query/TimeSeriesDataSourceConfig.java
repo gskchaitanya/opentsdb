@@ -1,5 +1,5 @@
 // This file is part of OpenTSDB.
-// Copyright (C) 2018  The OpenTSDB Authors.
+// Copyright (C) 2018-2019  The OpenTSDB Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,10 +14,13 @@
 // limitations under the License.
 package net.opentsdb.query;
 
+import java.time.temporal.TemporalAmount;
 import java.util.List;
+import java.util.Map;
 
 import net.opentsdb.query.filter.MetricFilter;
 import net.opentsdb.query.filter.QueryFilter;
+import net.opentsdb.utils.Pair;
 
 /**
  * The base class for a data source, including ddata types, filters
@@ -69,6 +72,27 @@ public interface TimeSeriesDataSourceConfig extends QueryNodeConfig {
   /** @return An optional post-query end time padding string as a duration. */
   public String getPostPadding();
   
+  /** @return An optional time shift interval for emitting additional time series
+   * with the same metric + filters but at additional offsets. Useful for 
+   * period over period plots. In the TSDB duration format, e.g. "1w". */
+  public String getTimeShiftInterval();
+  
+  /** @return The number of intervals previous to the current query time range
+   * to fetch data for, offset by {@link #getTimeShiftInterval()}. */
+  public int getPreviousIntervals();
+  
+  /** @return The number of intervals after the current query time range to 
+   * fetch data for, offset by {@link #getTimeShiftInterval()}. */
+  public int getNextIntervals();
+  
+  /** @return An optional map of dataSource() names to temporal amounts. 
+   * The values are <previous == true/post == false, TemporalAmount> */
+  public Map<String, Pair<Boolean, TemporalAmount>> timeShifts();
+  
+  /** @return Whether or not the node has been setup so we can avoid infinite
+   * loops when configuring the graph. */
+  public boolean hasBeenSetup();
+  
   /**
    * A base builder interface for data source configs.
    */
@@ -107,6 +131,17 @@ public interface TimeSeriesDataSourceConfig extends QueryNodeConfig {
     public Builder setPrePadding(final String pre_padding);
     
     public Builder setPostPadding(final String post_padding);
+    
+    public Builder setTimeShiftInterval(final String interval);
+    
+    public Builder setPreviousIntervals(final int intervals);
+    
+    public Builder setNextIntervals(final int intervals);
+    
+    public Builder setTimeShifts(
+        final Map<String, Pair<Boolean, TemporalAmount>> amounts);
+    
+    public Builder setHasBeenSetup(final boolean has_been_setup);
     
     public String id();
     

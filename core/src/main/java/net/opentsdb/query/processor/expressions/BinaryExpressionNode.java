@@ -18,14 +18,19 @@ import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
 
+import com.google.common.base.Strings;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
+import com.google.common.reflect.TypeToken;
 import com.stumbleupon.async.Callback;
 
 import net.opentsdb.common.Const;
 import net.opentsdb.data.TimeSeriesByteId;
+import net.opentsdb.data.TimeSeriesId;
 import net.opentsdb.exceptions.QueryDownstreamException;
 import net.opentsdb.query.AbstractQueryNode;
+import net.opentsdb.query.BaseWrappedQueryResult;
+import net.opentsdb.query.QueryNode;
 import net.opentsdb.query.QueryNodeConfig;
 import net.opentsdb.query.QueryNodeFactory;
 import net.opentsdb.query.QueryPipelineContext;
@@ -123,10 +128,19 @@ public class BinaryExpressionNode extends AbstractQueryNode {
   @Override
   public void onNext(final QueryResult next) {
     if (results.containsKey(next.dataSource())) {
+      if (!Strings.isNullOrEmpty(next.error()) || next.exception() != null) {
+        sendUpstream(new FailedQueryResult(next));
+        return;
+      }
       synchronized (this) {
         results.put(next.dataSource(), next);
       }
-    } else if (results.containsKey(next.source().config().getId())) {
+    } else if (results.containsKey(next.source().config().getId()) || 
+        next.exception() != null) {
+      if (!Strings.isNullOrEmpty(next.error())) {
+        sendUpstream(new FailedQueryResult(next));
+        return;
+      }
       synchronized (this) {
         results.put(next.source().config().getId(), next);
       }
@@ -182,10 +196,26 @@ public class BinaryExpressionNode extends AbstractQueryNode {
         }
       }
       
-      ((TimeSeriesByteId) next.timeSeries().iterator().next().id())
-        .dataStore().encodeJoinMetrics(metrics, null /* TODO */)
-        .addCallback(new ResolveCB())
-        .addErrback(new ErrorCB());
+      if (next.timeSeries() == null || next.timeSeries().isEmpty()) {
+        onNext(new BaseWrappedQueryResult(next) {
+          
+          @Override
+          public QueryNode source() {
+            return BinaryExpressionNode.this;
+          }
+          
+          @Override
+          public TypeToken<? extends TimeSeriesId> idType() {
+            return Const.TS_STRING_ID;
+          }
+          
+        });
+      } else {
+        ((TimeSeriesByteId) next.timeSeries().iterator().next().id())
+          .dataStore().encodeJoinMetrics(metrics, null /* TODO */)
+          .addCallback(new ResolveCB())
+          .addErrback(new ErrorCB());
+      }
       return;
     }
     
@@ -257,6 +287,22 @@ public class BinaryExpressionNode extends AbstractQueryNode {
         sendUpstream(e);
       }
     }
+  }
+  
+  /**
+   * Wrapper for failed queries.
+   */
+  class FailedQueryResult extends BaseWrappedQueryResult {
+
+    public FailedQueryResult(final QueryResult result) {
+      super(result);
+    }
+
+    @Override
+    public QueryNode source() {
+      return BinaryExpressionNode.this;
+    }
+    
   }
   
   ExpressionConfig expressionConfig() {

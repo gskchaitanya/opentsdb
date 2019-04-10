@@ -16,6 +16,7 @@ package net.opentsdb.storage;
 
 import java.time.Duration;
 import java.time.temporal.ChronoUnit;
+import java.time.temporal.TemporalAmount;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
@@ -54,6 +55,7 @@ import net.opentsdb.stats.Span;
 import net.opentsdb.storage.schemas.tsdb1x.Schema;
 import net.opentsdb.utils.Bytes;
 import net.opentsdb.utils.DateTime;
+import net.opentsdb.utils.Pair;
 
 /**
  * Class that handles fetching TSDB data from storage using GetRequests 
@@ -282,6 +284,17 @@ public class Tsdb1xMultiGet implements HBaseExecutor {
     timestamp = getInitialTimestamp(rollup_index);
     end_timestamp = reversed ? node.pipelineContext().query().startTime().getCopy() :
         node.pipelineContext().query().endTime().getCopy();
+    if (source_config.timeShifts() != null && 
+        source_config.timeShifts().containsKey(source_config.getId())) {
+      final Pair<Boolean, TemporalAmount> pair = 
+          source_config.timeShifts().get(source_config.getId());
+      if (pair.getKey()) {
+        end_timestamp.subtract(pair.getValue());
+      } else {
+        end_timestamp.add(pair.getValue());
+      }
+    }
+    
     if (!Strings.isNullOrEmpty(source_config.getPostPadding())) {
       end_timestamp.add(DateTime.parseDuration2(source_config.getPostPadding()));
     }
@@ -496,6 +509,24 @@ public class Tsdb1xMultiGet implements HBaseExecutor {
         } else {
           rollup_index++;
         }
+        
+        if (rollup_index >= tables.size()) {
+          // no fallback, we're done.
+          final QueryResult result = current_result;
+          current_result = null;
+          if (child != null) {
+            child.setSuccessTags().finish();
+          }
+          if (node.pipelineContext().query().isTraceEnabled()) {
+            node.pipelineContext().queryContext().logTrace(node, 
+                "Finished multi-get query in: " 
+                    + DateTime.msFromNanoDiff(DateTime.nanoTime(), fetch_start));
+          }
+          state = State.COMPLETE;
+          node.onNext(result);
+          return;
+        }
+        
         while (outstanding < concurrency_multi_get && !advance() && !has_failed) {
           outstanding++;
           nextBatch(tsuid_idx, (int) fallback_timestamp.epoch(), child);
@@ -734,6 +765,20 @@ public class Tsdb1xMultiGet implements HBaseExecutor {
    */
   @VisibleForTesting
   TimeStamp getInitialTimestamp(final int rollup_index) {
+    final TimeStamp timestamp = reversed ? 
+        node.pipelineContext().query().endTime().getCopy() : 
+          node.pipelineContext().query().startTime().getCopy();
+    if (source_config.timeShifts() != null && 
+        source_config.timeShifts().containsKey(source_config.getId())) {
+      final Pair<Boolean, TemporalAmount> pair = 
+          source_config.timeShifts().get(source_config.getId());
+      if (pair.getKey()) {
+        timestamp.subtract(pair.getValue());
+      } else {
+        timestamp.add(pair.getValue());
+      }
+    }
+    
     if (rollups_enabled && rollup_index >= 0 && 
         rollup_index < node.rollupIntervals().size()) {
       final Collection<QueryNode> rates = node.pipelineContext()
@@ -741,16 +786,14 @@ public class Tsdb1xMultiGet implements HBaseExecutor {
       final RollupInterval interval = node.rollupIntervals().get(0);
       if (!rates.isEmpty()) {
         return new MillisecondTimeStamp((long) RollupUtils.getRollupBasetime(
-            (reversed ? node.pipelineContext().query().endTime().epoch() + 1 : 
-              node.pipelineContext().query().startTime().epoch() - 1), interval) * 1000L);      
+            (reversed ? timestamp.epoch() + 1 : timestamp.epoch() - 1), interval) * 1000L);      
       } else {
         return new MillisecondTimeStamp((long) RollupUtils.getRollupBasetime(
             (reversed ? node.pipelineContext().query().endTime().epoch() : 
               node.pipelineContext().query().startTime().epoch()), interval) * 1000L);
       }
     } else {
-      long ts = reversed ? node.pipelineContext().query().endTime().epoch() : 
-        node.pipelineContext().query().startTime().epoch();
+      long ts = timestamp.epoch();
       if (!(Strings.isNullOrEmpty(source_config.getPrePadding()))) {
         final long interval = DateTime.parseDuration(source_config.getPrePadding());
         if (interval > 0) {
